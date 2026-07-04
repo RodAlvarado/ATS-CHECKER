@@ -1,5 +1,6 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import dotenv from "dotenv";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
@@ -10,14 +11,48 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
+// Robust API key loader to handle both environment variables and Render's "Secret Files"
+function getApiKey(): string {
+  if (process.env.GEMINI_API_KEY) {
+    return process.env.GEMINI_API_KEY;
+  }
+
+  // Render secret file paths and generic fallbacks
+  const secretPaths = [
+    "/etc/secrets/DefaultGeminiAPIKey",
+    "./DefaultGeminiAPIKey",
+    "/etc/secrets/GEMINI_API_KEY",
+    "./GEMINI_API_KEY",
+  ];
+
+  for (const p of secretPaths) {
+    try {
+      const resolvedPath = path.resolve(p);
+      if (fs.existsSync(resolvedPath)) {
+        const content = fs.readFileSync(resolvedPath, "utf8").trim();
+        if (content) {
+          console.log(`Loaded API key from secret file: ${p}`);
+          // Inject it into process.env so all existing routes check pass
+          process.env.GEMINI_API_KEY = content;
+          return content;
+        }
+      }
+    } catch (e) {
+      // Ignore reading errors
+    }
+  }
+
+  return "";
+}
+
 // Initialize Gemini Client
-const apiKey = process.env.GEMINI_API_KEY;
+const apiKey = getApiKey();
 if (!apiKey) {
-  console.warn("WARNING: GEMINI_API_KEY environment variable is missing.");
+  console.warn("WARNING: GEMINI_API_KEY is missing (checked environment variables and /etc/secrets/DefaultGeminiAPIKey).");
 }
 
 const ai = new GoogleGenAI({
-  apiKey: apiKey || "",
+  apiKey: apiKey,
   httpOptions: {
     headers: {
       "User-Agent": "aistudio-build",
