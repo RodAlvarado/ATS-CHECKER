@@ -2,11 +2,22 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import dotenv from "dotenv";
+import { setGlobalDispatcher, Agent } from "undici";
 import { GoogleGenAI, Type } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import mammoth from "mammoth";
 
 dotenv.config();
+
+// Configure undici global dispatcher to increase fetch timeout to 5 minutes (300000ms)
+// This prevents HeadersTimeoutError / UND_ERR_HEADERS_TIMEOUT on Render during long Gemini generation requests.
+setGlobalDispatcher(
+  new Agent({
+    headersTimeout: 300000, // 5 minutes
+    bodyTimeout: 300000,    // 5 minutes
+    connectTimeout: 60000,  // 1 minute
+  })
+);
 
 const app = express();
 const PORT = 3000;
