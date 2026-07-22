@@ -68,8 +68,61 @@ const ai = new GoogleGenAI({
     headers: {
       "User-Agent": "aistudio-build",
     },
+    timeout: 300000, // 5 minutes in milliseconds
   },
 });
+
+async function generateContentWithRetry(params: {
+  contents: any;
+  config: any;
+  model?: string;
+}): Promise<any> {
+  const modelsToTry = [
+    params.model || "gemini-3.5-flash",
+    "gemini-flash-latest",
+    "gemini-3.1-flash-lite",
+  ];
+  
+  let lastError: any = null;
+  
+  for (const model of modelsToTry) {
+    let attempts = 3;
+    let delay = 1000; // 1 second initial delay
+    
+    while (attempts > 0) {
+      try {
+        console.log(`Attempting generateContent using model: ${model} (attempts remaining: ${attempts})`);
+        const response = await ai.models.generateContent({
+          model: model,
+          contents: params.contents,
+          config: params.config,
+        });
+        return response;
+      } catch (err: any) {
+        lastError = err;
+        const errMessage = err?.message || String(err);
+        const isTransient = 
+          errMessage.includes("503") || 
+          errMessage.includes("UNAVAILABLE") || 
+          errMessage.includes("high demand") || 
+          errMessage.includes("429") || 
+          errMessage.includes("RESOURCE_EXHAUSTED");
+          
+        if (isTransient) {
+          console.warn(`Transient Gemini API error with ${model}: ${errMessage}. Retrying in ${delay}ms...`);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay *= 2; // exponential backoff
+          attempts--;
+        } else {
+          console.error(`Non-transient or configuration error with ${model}: ${errMessage}. Trying next model...`);
+          break; 
+        }
+      }
+    }
+  }
+  
+  throw lastError || new Error("Failed to generate content with Gemini API after retries.");
+}
 
 function robustParseJson(text: string): any {
   let cleaned = text.trim();
@@ -211,7 +264,7 @@ Divide tus recomendaciones en viñetas simples y accionables bajo estos tres pil
       text: userPrompt
     });
 
-    const response = await ai.models.generateContent({
+    const response = await generateContentWithRetry({
       model: "gemini-3.5-flash",
       contents: contents,
       config: {
@@ -338,7 +391,7 @@ Viñeta original a mejorar: "${bullet}"
 Contexto de la descripción del trabajo (opcional): "${jobDescription || 'No provisto'}"
 `;
 
-    const response = await ai.models.generateContent({
+    const response = await generateContentWithRetry({
       model: "gemini-3.5-flash",
       contents: userPrompt,
       config: {
@@ -455,7 +508,7 @@ ${jobDescription}
 ${cvText}
 `;
 
-    const response = await ai.models.generateContent({
+    const response = await generateContentWithRetry({
       model: "gemini-3.5-flash",
       contents: userPrompt,
       config: {
