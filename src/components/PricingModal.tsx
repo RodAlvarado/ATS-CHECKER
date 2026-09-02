@@ -44,6 +44,7 @@ export const PricingModal: React.FC<PricingModalProps> = ({
         "Diagnóstico de alertas rojas y sesgos de formato",
         "Puntuación ATS sobre 100 y compatibilidad de keywords",
         "Descarga en formato Harvard ATS (Word & PDF)",
+        "Historial de revisiones guardado en tu cuenta",
       ],
     },
     {
@@ -61,11 +62,11 @@ export const PricingModal: React.FC<PricingModalProps> = ({
       color: "border-blue-500 shadow-lg shadow-blue-500/10 ring-2 ring-blue-500/20",
       buttonBg: "bg-blue-600 hover:bg-blue-700 text-white shadow-md shadow-blue-600/20",
       features: [
-        "6 Escaneos completos de CV independientes",
-        "Reescritura completa al estándar Harvard Business",
-        "Mejorador interactivo de viñetas con métricas de impacto",
-        "Compatibilidad con PDF, Word DOCX y TXT",
-        "Historial en la nube y ahorro del 17% vs básico",
+        "6 Escaneos completos frente a filtros ATS de USA",
+        "Diagnóstico de alertas rojas y sesgos de formato",
+        "Puntuación ATS sobre 100 y compatibilidad de keywords",
+        "Descarga en formato Harvard ATS (Word & PDF)",
+        "Historial de revisiones guardado en tu cuenta",
       ],
     },
     {
@@ -83,12 +84,11 @@ export const PricingModal: React.FC<PricingModalProps> = ({
       color: "border-amber-500 shadow-xl shadow-amber-500/10 ring-2 ring-amber-500/20",
       buttonBg: "bg-linear-to-r from-amber-600 to-amber-700 hover:from-amber-700 hover:to-amber-800 text-white shadow-md shadow-amber-600/20",
       features: [
-        "12 Escaneos profundos de CV (Máxima cobertura)",
-        "Adaptación quirúrgica por industria y descripción de cargo",
-        "Optimización de logros cuantificables en dólares ($USD)",
-        "Acceso preferente al mejorador de viñetas ilimitado",
-        "El costo más bajo por revisión ($0.83 cada una)",
-        "Soporte y acceso vitalicio al historial de revisiones",
+        "12 Escaneos completos frente a filtros ATS de USA",
+        "Diagnóstico de alertas rojas y sesgos de formato",
+        "Puntuación ATS sobre 100 y compatibilidad de keywords",
+        "Descarga en formato Harvard ATS (Word & PDF)",
+        "Historial de revisiones guardado en tu cuenta",
       ],
     },
   ];
@@ -217,8 +217,8 @@ export const PricingModal: React.FC<PricingModalProps> = ({
                 className={`relative bg-white rounded-2xl p-6 border-2 flex flex-col justify-between transition-all hover:scale-[1.01] ${plan.color}`}
               >
                 {plan.badge && (
-                  <div className="absolute -top-3 left-1/2 -translate-x-1/2">
-                    <span className={`px-3 py-0.5 rounded-full text-[10px] font-extrabold tracking-wider uppercase text-white shadow-xs ${
+                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 z-10 whitespace-nowrap">
+                    <span className={`px-3 py-1 rounded-full text-[10px] font-extrabold tracking-wider uppercase text-white shadow-xs whitespace-nowrap inline-block ${
                       plan.bestValue ? "bg-amber-600" : "bg-blue-600"
                     }`}>
                       {plan.badge}
