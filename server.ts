@@ -708,6 +708,202 @@ app.post("/api/download-docx", (req, res) => {
   }
 });
 
+// --- STRIPE & PLANS PAYMENT INTEGRATION ---
+import Stripe from "stripe";
+
+let stripeClient: Stripe | null = null;
+function getStripe(): Stripe | null {
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) {
+    return null;
+  }
+  if (!stripeClient) {
+    stripeClient = new Stripe(key, {
+      apiVersion: "2025-02-24.acacia" as any,
+    });
+  }
+  return stripeClient;
+}
+
+export interface PlanConfig {
+  id: "basico" | "postulante" | "empleo_usa";
+  name: string;
+  priceUsd: number;
+  amountCents: number;
+  credits: number;
+  badge?: string;
+  popular?: boolean;
+  description: string;
+  features: string[];
+}
+
+export const ATS_PLANS: Record<string, PlanConfig> = {
+  basico: {
+    id: "basico",
+    name: "Plan Básico",
+    priceUsd: 1,
+    amountCents: 100,
+    credits: 1,
+    description: "1 revisión de CV (Pago único)",
+    badge: "Acceso Rápido",
+    features: [
+      "1 Escaneo completo de CV frente a filtros ATS",
+      "Diagnóstico exhaustivo de alertas rojas y sesgos",
+      "Puntuación ATS sobre 100 y compatibilidad de palabras clave",
+      "Exportación en Formato Harvard ATS (Word y PDF/Print)",
+    ],
+  },
+  postulante: {
+    id: "postulante",
+    name: "Plan Postulante",
+    priceUsd: 5,
+    amountCents: 500,
+    credits: 6,
+    popular: true,
+    badge: "Más Popular",
+    description: "6 revisiones de CV (Pago único)",
+    features: [
+      "6 Escaneos completos para postular a múltiples ofertas",
+      "Reescritura completa al estándar de Estados Unidos",
+      "Mejorador interactivo de viñetas con métricas de impacto",
+      "Soporte directo para archivos PDF, DOCX y TXT",
+      "Historial de revisiones sincronizado en la nube",
+    ],
+  },
+  empleo_usa: {
+    id: "empleo_usa",
+    name: "Plan Empleo en USA",
+    priceUsd: 10,
+    amountCents: 1000,
+    credits: 12,
+    badge: "Mejor Inversión",
+    description: "12 revisiones de CV (Pago único)",
+    features: [
+      "12 Escaneos de CV para búsqueda intensiva de empleo",
+      "Adaptación a medida por industria y vacante en USA",
+      "Plantilla Harvard Resume optimizada para roles remotos",
+      "Asesoría de viñetas con impacto cuantitativo de negocio",
+      "Solo $0.83 USD por revisión (El mejor costo por escaneo)",
+      "Historial de revisiones permanente",
+    ],
+  },
+};
+
+// Get available plans
+app.get("/api/plans", (_req, res) => {
+  res.json({
+    plans: Object.values(ATS_PLANS),
+    stripeConfigured: Boolean(process.env.STRIPE_SECRET_KEY),
+  });
+});
+
+// Create Stripe Checkout Session
+app.post("/api/stripe/create-checkout-session", async (req, res) => {
+  try {
+    const { planId, userId, userEmail, returnUrl } = req.body;
+
+    const selectedPlan = ATS_PLANS[planId];
+    if (!selectedPlan) {
+      return res.status(400).json({ error: "Plan inválido seleccionado." });
+    }
+
+    const stripe = getStripe();
+
+    // If Stripe key is configured, create real Stripe Checkout Session
+    if (stripe) {
+      const baseUrl = returnUrl || process.env.APP_URL || "http://localhost:3000";
+      
+      const session = await stripe.checkout.sessions.create({
+        payment_method_types: ["card"],
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: {
+                name: `${selectedPlan.name} - ATS Checker USA PLACEMENT`,
+                description: `${selectedPlan.description} | ${selectedPlan.credits} revisiones de CV garantizadas`,
+                images: ["https://raw.githubusercontent.com/lucide-icons/lucide/main/icons/file-check.png"],
+              },
+              unit_amount: selectedPlan.amountCents,
+            },
+            quantity: 1,
+          },
+        ],
+        mode: "payment",
+        customer_email: userEmail || undefined,
+        metadata: {
+          userId: userId || "",
+          planId: selectedPlan.id,
+          credits: String(selectedPlan.credits),
+          amountUsd: String(selectedPlan.priceUsd),
+        },
+        success_url: `${baseUrl}?stripe_success=true&session_id={CHECKOUT_SESSION_ID}&plan=${selectedPlan.id}&credits=${selectedPlan.credits}`,
+        cancel_url: `${baseUrl}?stripe_canceled=true`,
+      });
+
+      return res.json({
+        url: session.url,
+        sessionId: session.id,
+        simulated: false,
+      });
+    } else {
+      // In sandbox/preview mode without key: simulate checkout response
+      // Allows immediate testing of the credit acquisition flow!
+      return res.json({
+        simulated: true,
+        plan: selectedPlan,
+        creditsAdded: selectedPlan.credits,
+        message: "Modo simulador de pagos activo (para pagos reales en producción configura STRIPE_SECRET_KEY en las variables de entorno).",
+      });
+    }
+  } catch (error: any) {
+    console.error("Error creating checkout session:", error);
+    res.status(500).json({ error: error?.message || "Error al crear la sesión de pago." });
+  }
+});
+
+// Verify Stripe Session
+app.post("/api/stripe/verify-session", async (req, res) => {
+  try {
+    const { sessionId, planId } = req.body;
+    const stripe = getStripe();
+
+    if (!stripe) {
+      const plan = ATS_PLANS[planId] || ATS_PLANS.basico;
+      return res.json({
+        verified: true,
+        simulated: true,
+        credits: plan.credits,
+        planId: plan.id,
+        amount: plan.priceUsd,
+      });
+    }
+
+    if (!sessionId) {
+      return res.status(400).json({ error: "sessionId es requerido." });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.payment_status === "paid") {
+      const planFromMeta = session.metadata?.planId || planId || "basico";
+      const creditsFromMeta = session.metadata?.credits ? parseInt(session.metadata.credits, 10) : (ATS_PLANS[planFromMeta]?.credits || 1);
+      
+      return res.json({
+        verified: true,
+        paid: true,
+        credits: creditsFromMeta,
+        planId: planFromMeta,
+        amount: (session.amount_total || 100) / 100,
+      });
+    } else {
+      return res.status(400).json({ verified: false, paid: false, status: session.payment_status });
+    }
+  } catch (error: any) {
+    console.error("Error verifying Stripe session:", error);
+    res.status(500).json({ error: error?.message || "Error al verificar la sesión de pago." });
+  }
+});
+
 // Start server function and setup Vite or static serving
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {

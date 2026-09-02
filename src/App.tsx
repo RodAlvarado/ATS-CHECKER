@@ -28,10 +28,31 @@ import {
   Download,
   Printer,
   Eye,
-  Code
+  Code,
+  LogIn,
+  UserPlus,
+  LogOut,
+  CreditCard,
+  ShieldCheck,
+  Zap
 } from "lucide-react";
 import { EvaluationResult, ScanHistoryItem } from "./types";
 import { SAMPLE_JOB_DESCRIPTION, SAMPLE_CV } from "./components/SampleData";
+import AtsCheckerLogo from "./components/AtsCheckerLogo";
+import AuthModal from "./components/AuthModal";
+import PricingModal from "./components/PricingModal";
+import EmailVerificationNotice from "./components/EmailVerificationNotice";
+import {
+  auth,
+  subscribeUserProfile,
+  deductCredit,
+  saveScanRecord,
+  logoutUser,
+  UserProfile,
+  syncUserProfile,
+  processStripePaymentSession,
+} from "./firebase";
+import { onAuthStateChanged, User as FirebaseUser } from "firebase/auth";
 
 export default function App() {
   const [step, setStep] = useState<1 | 2 | 3>(1);
@@ -64,6 +85,105 @@ export default function App() {
   const [cvViewMode, setCvViewMode] = useState<"markdown" | "preview">("preview");
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Authentication & Stripe Pricing State
+  const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [authModalInitialMode, setAuthModalInitialMode] = useState<"login" | "register">("login");
+  const [pricingModalOpen, setPricingModalOpen] = useState(false);
+  const [successNotification, setSuccessNotification] = useState<string | null>(null);
+
+  // Listen to Firebase Auth state
+  useEffect(() => {
+    let unsubscribeProfile: (() => void) | null = null;
+
+    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+      setCurrentUser(user);
+      if (user) {
+        try {
+          await syncUserProfile(user);
+
+          // Check if there was a pending Stripe payment waiting for login
+          const pendingStr = localStorage.getItem("pending_stripe_session");
+          if (pendingStr) {
+            try {
+              const pending = JSON.parse(pendingStr);
+              localStorage.removeItem("pending_stripe_session");
+              const result = await processStripePaymentSession(user.uid, pending.sessionId, pending.planKey);
+              if (result.alreadyProcessed) {
+                setSuccessNotification("Tu pago de Stripe ya había sido acreditado a esta cuenta.");
+              } else {
+                setSuccessNotification(
+                  `¡Pago de Stripe acreditado con éxito! Se han sumado +${result.creditsAdded} revisiones acumulables (${result.planName}).`
+                );
+              }
+              setTimeout(() => setSuccessNotification(null), 9000);
+            } catch (pendingErr) {
+              console.error("Error processing pending session:", pendingErr);
+            }
+          }
+        } catch (e) {
+          console.error("Error syncing profile:", e);
+        }
+        unsubscribeProfile = subscribeUserProfile(user.uid, (profile) => {
+          setUserProfile(profile);
+        });
+      } else {
+        setUserProfile(null);
+        if (unsubscribeProfile) {
+          unsubscribeProfile();
+          unsubscribeProfile = null;
+        }
+      }
+    });
+
+    return () => {
+      unsubscribeAuth();
+      if (unsubscribeProfile) unsubscribeProfile();
+    };
+  }, []);
+
+  // Handle Stripe redirect URL parameters (supports ?payment=success&plan=...&session_id=...)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const isPaymentSuccess = params.get("payment") === "success" || params.get("stripe_success") === "true";
+    const sessionId = params.get("session_id") || "";
+    const planKey = params.get("plan") || "basico";
+    const stripeCanceled = params.get("stripe_canceled") || params.get("payment") === "cancel";
+
+    if (isPaymentSuccess) {
+      // Clean query parameters from URL immediately
+      window.history.replaceState({}, document.title, window.location.pathname);
+
+      if (currentUser) {
+        processStripePaymentSession(currentUser.uid, sessionId, planKey).then((res) => {
+          if (res.alreadyProcessed) {
+            setSuccessNotification(`Este pago ya fue acreditado previamente a tu cuenta.`);
+          } else {
+            setSuccessNotification(
+              `¡Pago recibido con éxito! Se sumaron +${res.creditsAdded} revisiones acumulables a tu saldo (${res.planName}).`
+            );
+          }
+          setTimeout(() => setSuccessNotification(null), 9000);
+        }).catch((err) => {
+          console.error("Error processing payment:", err);
+          setError("Recibimos tu pago pero hubo un detalle al actualizar el contador. Por favor refresca.");
+        });
+      } else {
+        // User not logged in yet: save session to claim upon authentication
+        localStorage.setItem("pending_stripe_session", JSON.stringify({ sessionId, planKey }));
+        setSuccessNotification(
+          "¡Pago de Stripe recibido! Inicia sesión o regístrate para acreditar tus revisiones a tu cuenta."
+        );
+        setAuthModalInitialMode("register");
+        setAuthModalOpen(true);
+      }
+    } else if (stripeCanceled) {
+      window.history.replaceState({}, document.title, window.location.pathname);
+      setError("El proceso de pago en Stripe fue cancelado.");
+    }
+  }, [currentUser]);
 
   // Load history from LocalStorage
   useEffect(() => {
@@ -168,6 +288,26 @@ export default function App() {
     if (e) e.preventDefault();
     if (!jobDescription.trim() || (!cvText.trim() && !fileBase64)) return;
 
+    // Check user authentication
+    if (!currentUser) {
+      setAuthModalInitialMode("register");
+      setAuthModalOpen(true);
+      return;
+    }
+
+    // Check email verification strictly
+    if (!currentUser.emailVerified) {
+      setError("Debes validar tu correo electrónico antes de realizar evaluaciones de CV. Revisa el banner de validación.");
+      return;
+    }
+
+    // Check credit balance
+    if (!userProfile || userProfile.credits <= 0) {
+      setPricingModalOpen(true);
+      setError("No dispones de revisiones suficientes. Elige uno de nuestros planes ($1, $5 o $10) para continuar.");
+      return;
+    }
+
     setLoading(true);
     setError(null);
 
@@ -196,6 +336,13 @@ export default function App() {
       if (result.extractedCvText) {
         setCvText(result.extractedCvText);
       }
+
+      // Deduct 1 credit in Firestore
+      try {
+        await deductCredit(currentUser.uid);
+      } catch (creditErr) {
+        console.error("Error deducting credit:", creditErr);
+      }
       
       // Save to history
       let extractedTitle = "Análisis de CV";
@@ -213,11 +360,29 @@ export default function App() {
         result,
       };
 
+      // Save to Firestore
+      try {
+        await saveScanRecord(currentUser.uid, {
+          jobTitle: extractedTitle,
+          jobDescription,
+          cvSnippet: result.extractedCvText || cvText,
+          score: result.puntuacion,
+          result,
+        });
+      } catch (saveErr) {
+        console.error("Error saving scan to Firestore:", saveErr);
+      }
+
       const updatedHistory = [newScanItem, ...history.filter(h => h.jobDescription !== jobDescription)];
       saveHistory(updatedHistory);
 
       // Move to Step 2
       setStep(2);
+      const remainingCredits = Math.max(0, (userProfile?.credits ?? 1) - 1);
+      setSuccessNotification(
+        `¡Revisión ATS completada con éxito! Se descontó 1 revisión. Te quedan ${remainingCredits} ${remainingCredits === 1 ? "revisión" : "revisiones"} disponibles.`
+      );
+      setTimeout(() => setSuccessNotification(null), 8000);
     } catch (err: any) {
       console.error(err);
       setError(err?.message || "Ocurrió un error al analizar tu CV frente a los filtros ATS.");
@@ -640,27 +805,114 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 font-sans antialiased selection:bg-blue-600/10 selection:text-blue-900">
       
-      {/* HEADER: strictly "ATS checker" only */}
-      <header className="border-b border-slate-200 bg-white py-5 px-6 sticky top-0 z-50 shadow-xs">
-        <div className="max-w-5xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
+      {/* HEADER: Official Logo, Program Branding & User Controls */}
+      <header className="border-b border-slate-200 bg-white py-3.5 px-4 sm:px-6 sticky top-0 z-50 shadow-xs">
+        <div className="max-w-6xl mx-auto flex flex-col md:flex-row items-center justify-between gap-3">
+          
+          {/* Logo & Title */}
           <div className="flex items-center space-x-3 cursor-pointer" onClick={handleReset}>
-            <div className="w-9 h-9 bg-blue-600 text-white rounded-lg flex items-center justify-center font-bold text-lg shadow-md shadow-blue-600/15">
-              ✓
+            <AtsCheckerLogo size="sm" showSubtitle={false} />
+            <div>
+              <div className="flex items-center space-x-2">
+                <span className="text-base sm:text-lg font-black tracking-tight text-slate-900">
+                  ATS-CHECKER
+                </span>
+                <span className="hidden sm:inline-block px-2 py-0.5 rounded-full text-[9px] font-extrabold uppercase tracking-widest bg-blue-50 text-blue-700 border border-blue-200">
+                  BY USAPLACEMENT
+                </span>
+              </div>
+              <p className="text-[10px] text-slate-500 font-mono hidden sm:block">
+                USA Placement Program • Harvard ATS Compliant
+              </p>
             </div>
-            <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-              ATS Checker - USA PLACEMENT PROGRAM
-            </h1>
           </div>
 
-          <div className="flex items-center space-x-2 text-xs text-slate-500 bg-slate-100 px-3 py-1.5 rounded-lg border border-slate-200 font-mono">
-            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-            <span>LECTOR INTELIGENTE ACTIVO</span>
+          {/* User Auth & Credits Bar */}
+          <div className="flex items-center space-x-2 sm:space-x-3 text-xs">
+            {currentUser ? (
+              <div className="flex items-center space-x-2 sm:space-x-3 bg-slate-50 p-1.5 px-3 rounded-xl border border-slate-200">
+                {/* Email Verification Status */}
+                {currentUser.emailVerified ? (
+                  <span className="hidden sm:inline-flex items-center space-x-1 px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[10px] font-bold border border-emerald-200">
+                    <ShieldCheck className="w-3 h-3" />
+                    <span>Verificado</span>
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center space-x-1 px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 text-[10px] font-bold border border-amber-200 animate-pulse">
+                    <AlertTriangle className="w-3 h-3" />
+                    <span>Validar Correo</span>
+                  </span>
+                )}
+
+                {/* Credits Balance Button */}
+                <button
+                  onClick={() => setPricingModalOpen(true)}
+                  className="px-2.5 py-1 bg-amber-100/70 hover:bg-amber-100 text-amber-900 rounded-lg font-extrabold text-xs flex items-center space-x-1.5 transition-colors cursor-pointer border border-amber-300"
+                  title="Ver planes y adquirir más revisiones"
+                >
+                  <Zap className="w-3.5 h-3.5 text-amber-600 fill-amber-500" />
+                  <span>{userProfile?.credits ?? 0} {userProfile?.credits === 1 ? "revisión" : "revisiones"}</span>
+                </button>
+
+                {/* Buy Credits Button */}
+                <button
+                  onClick={() => setPricingModalOpen(true)}
+                  className="hidden md:flex items-center space-x-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold text-xs shadow-xs transition-colors cursor-pointer"
+                >
+                  <CreditCard className="w-3 h-3" />
+                  <span>+ Planes</span>
+                </button>
+
+                {/* User email & logout */}
+                <span className="text-slate-600 max-w-[120px] sm:max-w-[160px] truncate font-medium text-xs">
+                  {currentUser.email}
+                </span>
+
+                <button
+                  onClick={logoutUser}
+                  className="text-slate-400 hover:text-rose-600 p-1 rounded-md transition-colors"
+                  title="Cerrar sesión"
+                >
+                  <LogOut className="w-4 h-4" />
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center space-x-2">
+                <button
+                  onClick={() => setPricingModalOpen(true)}
+                  className="px-3 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-900 font-bold rounded-xl border border-amber-200 text-xs flex items-center space-x-1 transition-colors cursor-pointer"
+                >
+                  <CreditCard className="w-3.5 h-3.5 text-amber-600" />
+                  <span>Planes ($1, $5, $10)</span>
+                </button>
+
+                <button
+                  onClick={() => {
+                    setAuthModalInitialMode("login");
+                    setAuthModalOpen(true);
+                  }}
+                  className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-700 font-bold rounded-xl border border-slate-200 text-xs transition-colors cursor-pointer"
+                >
+                  Iniciar Sesión
+                </button>
+
+                <button
+                  onClick={() => {
+                    setAuthModalInitialMode("register");
+                    setAuthModalOpen(true);
+                  }}
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl text-xs shadow-xs transition-colors cursor-pointer"
+                >
+                  Registrarse
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </header>
 
       {/* STEP PROGRESS INDICATOR */}
-      <div className="bg-white border-b border-slate-200 py-5 px-4 shadow-2xs">
+      <div className="bg-white border-b border-slate-200 py-4 px-4 shadow-2xs">
         <div className="max-w-3xl mx-auto flex justify-between items-center text-xs font-mono">
           <button
             onClick={() => { if (step > 1) setStep(1); }}
@@ -698,6 +950,23 @@ export default function App() {
 
       <main className="max-w-5xl mx-auto px-4 py-8">
         
+        {/* SUCCESS NOTIFICATION */}
+        {successNotification && (
+          <div className="p-4 mb-6 bg-emerald-50 border border-emerald-200 rounded-xl flex items-start space-x-3 text-emerald-900 animate-fadeIn">
+            <CheckCircle2 className="w-5 h-5 mt-0.5 shrink-0 text-emerald-600" />
+            <div className="flex-1">
+              <h4 className="font-bold text-sm text-emerald-950">Confirmación del Sistema</h4>
+              <p className="text-xs text-emerald-800 mt-0.5">{successNotification}</p>
+            </div>
+            <button
+              onClick={() => setSuccessNotification(null)}
+              className="text-xs text-emerald-700 hover:underline font-mono font-bold"
+            >
+              CERRAR
+            </button>
+          </div>
+        )}
+
         {/* ERROR MESSAGE NOTIFICATION */}
         {error && (
           <div className="p-4 mb-6 bg-rose-50 border border-rose-200 rounded-xl flex items-start space-x-3 text-rose-800 animate-fadeIn">
@@ -760,36 +1029,88 @@ export default function App() {
         {/* STEP 1: IMPORT CV (FILE ONLY) & JOB DESCRIPTION */}
         {!loading && !loadingStep3 && step === 1 && (
           <div className="space-y-8 animate-fadeIn">
-            {/* INSTRUCTIONAL BANNER */}
-            <div className="text-center max-w-2xl mx-auto space-y-2">
-              <h2 className="text-3xl font-extrabold text-slate-900 tracking-tight">
-                Escanea tu CV contra los filtros ATS de USA
-              </h2>
-              <p className="text-slate-500 text-sm leading-relaxed">
-                Nuestra IA analizará conscientemente tu currículum, detectará alertas rojas de formato y generará una versión optimizada en inglés para el mercado estadounidense.
-              </p>
+            
+            {/* HERO LOGO & TITLE SECTION (PROMINENT AT START) */}
+            <div className="flex flex-col items-center justify-center space-y-4 text-center max-w-2xl mx-auto pt-2">
+              <div className="drop-shadow-md hover:scale-105 transition-transform duration-300">
+                <AtsCheckerLogo size="lg" />
+              </div>
+              <div className="space-y-1">
+                <h2 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight">
+                  Escanea y Optimiza tu CV contra Filtros ATS
+                </h2>
+                <p className="text-slate-500 text-xs sm:text-sm max-w-xl mx-auto leading-relaxed">
+                  Evaluador oficial de currículums bajo los estándares de contratación remota de Estados Unidos. Supera filtros automáticos y destaca con el formato Harvard Business.
+                </p>
+              </div>
             </div>
 
-            <div className="bg-white border border-slate-200 p-6 sm:p-8 rounded-2xl shadow-sm space-y-6">
-              
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-100 pb-5">
+            {/* 3 PLANS HIGHLIGHT BAR */}
+            <div className="bg-linear-to-r from-slate-900 via-blue-950 to-slate-900 rounded-2xl p-4 sm:p-5 text-white flex flex-col md:flex-row items-center justify-between gap-4 shadow-lg border border-blue-900/40">
+              <div className="flex items-center space-x-3 text-center md:text-left">
+                <div className="p-2.5 bg-white/10 rounded-xl shrink-0 hidden sm:block">
+                  <CreditCard className="w-5 h-5 text-amber-400" />
+                </div>
                 <div>
-                  <h3 className="text-lg font-bold text-slate-900">
-                    Paso 1: Carga tus Datos de Postulación
-                  </h3>
-                  <p className="text-slate-500 text-xs mt-0.5">
-                    Sube tu archivo y pega la descripción del cargo para iniciar el análisis automático.
-                  </p>
+                  <h4 className="font-bold text-sm text-white">Planes Oficiales de Revisiones (Pago Único)</h4>
+                  <p className="text-xs text-blue-200/80">Sin mensualidades ni cobros recurrentes. Tus revisiones nunca caducan:</p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 text-xs flex-wrap justify-center">
+                <div className="bg-white/10 px-3 py-1.5 rounded-lg border border-white/10 flex items-center space-x-1.5">
+                  <span className="font-bold text-white">Básico: $1</span>
+                  <span className="text-[10px] text-blue-200 font-mono">(1 CV)</span>
+                </div>
+                <div className="bg-blue-600/70 px-3 py-1.5 rounded-lg border border-blue-400/40 flex items-center space-x-1.5 shadow-xs">
+                  <span className="font-bold text-amber-300">★ Postulante: $5</span>
+                  <span className="text-[10px] text-blue-100 font-mono">(6 CVs)</span>
+                </div>
+                <div className="bg-amber-500/20 px-3 py-1.5 rounded-lg border border-amber-400/30 flex items-center space-x-1.5">
+                  <span className="font-bold text-amber-400">Empleo USA: $10</span>
+                  <span className="text-[10px] text-amber-200 font-mono">(12 CVs)</span>
                 </div>
                 <button
-                  type="button"
-                  onClick={handleLoadSamples}
-                  className="bg-blue-50 hover:bg-blue-100 text-blue-600 border border-blue-100 px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center justify-center space-x-1.5 cursor-pointer"
+                  onClick={() => setPricingModalOpen(true)}
+                  className="px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-900 font-bold rounded-lg text-xs transition-colors cursor-pointer shadow-xs"
                 >
-                  <Sparkles className="w-4 h-4" />
-                  <span>Probar con ejemplo de la plataforma</span>
+                  Ver Planes →
                 </button>
               </div>
+            </div>
+
+            {/* STRICT EMAIL VERIFICATION ENFORCEMENT */}
+            {currentUser && !currentUser.emailVerified ? (
+              <EmailVerificationNotice
+                user={currentUser}
+                onVerified={() => {
+                  syncUserProfile(currentUser);
+                  setSuccessNotification("¡Correo verificado con éxito! Ahora puedes usar la plataforma.");
+                  setTimeout(() => setSuccessNotification(null), 6000);
+                }}
+              />
+            ) : (
+              /* MAIN EVALUATION INPUT FORM */
+              <div className="bg-white border border-slate-200 p-6 sm:p-8 rounded-2xl shadow-sm space-y-6">
+                
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-100 pb-5">
+                  <div>
+                    <h3 className="text-lg font-bold text-slate-900">
+                      Paso 1: Carga tus Datos de Postulación
+                    </h3>
+                    <p className="text-slate-500 text-xs mt-0.5">
+                      Sube tu archivo y pega la descripción del cargo para iniciar el análisis automático.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleLoadSamples}
+                    className="bg-blue-50 hover:bg-blue-100 text-blue-600 border border-blue-100 px-4 py-2 rounded-lg text-xs font-bold transition-all flex items-center justify-center space-x-1.5 cursor-pointer"
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    <span>Probar con ejemplo de la plataforma</span>
+                  </button>
+                </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                 
@@ -900,29 +1221,93 @@ export default function App() {
 
               </div>
 
-              {/* ACTION ROW */}
-              <div className="flex flex-col sm:flex-row items-center justify-center gap-4 pt-6 border-t border-slate-100">
-                <button
-                  type="button"
-                  onClick={() => handleAnalyze()}
-                  disabled={!uploadedFileName || !jobDescription.trim()}
-                  className="w-full sm:w-72 py-3.5 px-6 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-100 disabled:text-slate-400 text-white font-extrabold text-xs uppercase font-mono tracking-wider rounded-lg transition-all flex items-center justify-center space-x-2 shadow-md shadow-blue-600/10 cursor-pointer"
-                >
-                  <span>Analizar Compatibilidad (Paso 2)</span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
+              {/* ACTION ROW & CREDITS COUNTER */}
+              <div className="pt-6 border-t border-slate-100 flex flex-col items-center space-y-4">
+                
+                {/* Visual Credits Counter Indicator */}
+                {currentUser ? (
+                  <div className="flex flex-wrap items-center justify-center gap-2 text-xs">
+                    <div className={`flex items-center space-x-2 px-3.5 py-1.5 rounded-full border ${
+                      (userProfile?.credits ?? 0) > 0 
+                        ? "bg-amber-50/80 border-amber-200 text-amber-900" 
+                        : "bg-rose-50 border-rose-200 text-rose-800"
+                    }`}>
+                      <Zap className={`w-3.5 h-3.5 ${
+                        (userProfile?.credits ?? 0) > 0 ? "text-amber-600 fill-amber-500" : "text-rose-500"
+                      }`} />
+                      <span>
+                        Contador de Revisiones: <strong className="font-extrabold text-slate-900">{userProfile?.credits ?? 0}</strong> {userProfile?.credits === 1 ? "revisión disponible" : "revisiones disponibles"}
+                      </span>
+                    </div>
 
-                {(uploadedFileName || jobDescription.trim()) && (
-                  <button
-                    type="button"
-                    onClick={handleClearForm}
-                    className="text-xs text-slate-400 hover:text-rose-600 transition-colors cursor-pointer"
-                  >
-                    Limpiar todo e iniciar de cero
-                  </button>
+                    {(userProfile?.credits ?? 0) <= 1 && (
+                      <button
+                        type="button"
+                        onClick={() => setPricingModalOpen(true)}
+                        className="text-xs font-bold text-blue-600 hover:text-blue-800 hover:underline cursor-pointer"
+                      >
+                        + Adquirir más revisiones (Pago único)
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex items-center space-x-2 px-4 py-1.5 rounded-full bg-blue-50/80 border border-blue-200 text-xs text-blue-900">
+                    <Sparkles className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                    <span>
+                      Al crear tu cuenta recibes <strong>1 revisión gratuita</strong> de bienvenida.
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAuthModalInitialMode("register");
+                        setAuthModalOpen(true);
+                      }}
+                      className="text-xs font-extrabold text-blue-700 underline hover:text-blue-900 cursor-pointer ml-1"
+                    >
+                      Registrarme gratis
+                    </button>
+                  </div>
                 )}
+
+                <div className="flex flex-col sm:flex-row items-center justify-center gap-4 w-full">
+                  {currentUser && (userProfile?.credits ?? 0) === 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => setPricingModalOpen(true)}
+                      className="w-full sm:w-80 py-3.5 px-6 bg-linear-to-r from-amber-600 to-amber-700 hover:from-amber-700 hover:to-amber-800 text-white font-extrabold text-xs uppercase font-mono tracking-wider rounded-lg transition-all flex items-center justify-center space-x-2 shadow-md shadow-amber-600/20 cursor-pointer"
+                    >
+                      <Zap className="w-4 h-4 fill-white" />
+                      <span>Recargar Revisiones ($1, $5 o $10)</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => handleAnalyze()}
+                      disabled={!uploadedFileName || !jobDescription.trim()}
+                      className="w-full sm:w-80 py-3.5 px-6 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-100 disabled:text-slate-400 text-white font-extrabold text-xs uppercase font-mono tracking-wider rounded-lg transition-all flex items-center justify-center space-x-2 shadow-md shadow-blue-600/10 cursor-pointer"
+                    >
+                      <span>
+                        {!currentUser
+                          ? "Analizar (1 revisión gratuita)"
+                          : `Analizar Compatibilidad (Consume 1)`}
+                      </span>
+                      <ArrowRight className="w-4 h-4" />
+                    </button>
+                  )}
+
+                  {(uploadedFileName || jobDescription.trim()) && (
+                    <button
+                      type="button"
+                      onClick={handleClearForm}
+                      className="text-xs text-slate-400 hover:text-rose-600 transition-colors cursor-pointer"
+                    >
+                      Limpiar todo e iniciar de cero
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
+            )}
 
             {/* HISTORIAL LOCAL */}
             {history.length > 0 && (
@@ -1662,6 +2047,34 @@ export default function App() {
           </div>
         </div>
       </footer>
+
+      {/* MODALS */}
+      <AuthModal
+        isOpen={authModalOpen}
+        onClose={() => setAuthModalOpen(false)}
+        initialMode={authModalInitialMode}
+        onSuccess={() => {
+          setAuthModalOpen(false);
+          setSuccessNotification("¡Sesión iniciada con éxito!");
+          setTimeout(() => setSuccessNotification(null), 5000);
+        }}
+      />
+
+      <PricingModal
+        isOpen={pricingModalOpen}
+        onClose={() => setPricingModalOpen(false)}
+        user={currentUser}
+        userProfile={userProfile}
+        onPlanPurchased={(creditsAdded, planName) => {
+          setSuccessNotification(`¡Has adquirido el ${planName}! Se agregaron ${creditsAdded} revisiones de CV.`);
+          setTimeout(() => setSuccessNotification(null), 8000);
+        }}
+        onRequireAuth={() => {
+          setPricingModalOpen(false);
+          setAuthModalInitialMode("register");
+          setAuthModalOpen(true);
+        }}
+      />
     </div>
   );
 }

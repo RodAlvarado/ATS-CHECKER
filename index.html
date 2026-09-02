@@ -4,6 +4,27 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ATS Checker - USA PLACEMENT PROGRAM</title>
+    <meta name="description" content="Evalúa si un CV de LATAM pasará los filtros ATS y humanos para puestos remotos en EE.UU., ofreciendo feedback accionable y optimización de palabras clave." />
+    <meta property="og:title" content="ATS Checker - USA PLACEMENT PROGRAM" />
+    <meta property="og:description" content="Evalúa si un CV de LATAM pasará los filtros ATS y humanos para puestos remotos en EE.UU., ofreciendo feedback accionable y optimización de palabras clave." />
+    <script>
+      // Ensure window.fetch has a setter so iframe tools or proxies can wrap it without throwing
+      try {
+        let _customFetch = window.fetch.bind(window);
+        Object.defineProperty(window, 'fetch', {
+          get() {
+            return _customFetch;
+          },
+          set(val) {
+            _customFetch = val;
+          },
+          configurable: true,
+          enumerable: true
+        });
+      } catch (e) {
+        // Fallback if property is already frozen
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

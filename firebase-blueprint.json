@@ -1,0 +1,52 @@
+{
+  "entities": {
+    "User": {
+      "fields": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "emailVerified": { "type": "boolean" },
+        "credits": { "type": "number" },
+        "plan": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      }
+    },
+    "Scan": {
+      "fields": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "jobTitle": { "type": "string" },
+        "jobDescription": { "type": "string" },
+        "cvSnippet": { "type": "string" },
+        "score": { "type": "number" },
+        "result": { "type": "map" },
+        "timestamp": { "type": "string" }
+      }
+    },
+    "Payment": {
+      "fields": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "planId": { "type": "string" },
+        "amount": { "type": "number" },
+        "creditsAdded": { "type": "number" },
+        "status": { "type": "string" },
+        "timestamp": { "type": "string" }
+      }
+    }
+  },
+  "firestore": {
+    "users": {
+      "entity": "User",
+      "path": "/users/{userId}"
+    },
+    "scans": {
+      "entity": "Scan",
+      "path": "/scans/{scanId}"
+    },
+    "payments": {
+      "entity": "Payment",
+      "path": "/payments/{paymentId}"
+    }
+  }
+}
