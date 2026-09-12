@@ -83,7 +83,20 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       onClose();
     } catch (err: any) {
       console.error("Google login error:", err);
-      setError("No se pudo iniciar sesión con Google. Intenta nuevamente.");
+      const code = err?.code || "";
+      const msg = err?.message || "";
+      if (code === "auth/operation-not-allowed" || msg.includes("operation-not-allowed")) {
+        setError("Falta activar el proveedor 'Google' en tu consola de Firebase: Ve a Authentication > Sign-in method > Google y actívalo.");
+      } else if (code === "auth/unauthorized-domain" || msg.includes("unauthorized-domain")) {
+        const currentHost = window.location.hostname;
+        setError(`Dominio no autorizado (${currentHost}). Agrégalo en Firebase Console > Authentication > Settings > Dominios autorizados.`);
+      } else if (code === "auth/popup-closed-by-user") {
+        setError("Se cerró la ventana de Google antes de completar el inicio de sesión.");
+      } else if (code === "auth/popup-blocked") {
+        setError("Tu navegador bloqueó la ventana emergente de Google. Por favor permite las ventanas emergentes (popups).");
+      } else {
+        setError(`Error al iniciar con Google: ${err?.message || "Verifica la configuración en Firebase."}`);
+      }
     } finally {
       setLoading(false);
     }
