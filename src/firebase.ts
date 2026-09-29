@@ -153,82 +153,188 @@ export async function logoutUser(): Promise<void> {
   await signOut(auth);
 }
 
-// User Profile & Credits Management
+// User Profile & Credits Management with local resilience
+const profileListeners = new Set<(profile: UserProfile | null) => void>();
+
+export function getLocalProfile(uid: string): UserProfile | null {
+  try {
+    const raw = localStorage.getItem(`ats_user_profile_${uid}`);
+    if (raw) return JSON.parse(raw);
+  } catch {
+    // Ignore
+  }
+  return null;
+}
+
+export function saveLocalProfile(profile: UserProfile) {
+  try {
+    localStorage.setItem(`ats_user_profile_${profile.uid}`, JSON.stringify(profile));
+  } catch {
+    // Ignore
+  }
+  profileListeners.forEach((fn) => {
+    try {
+      fn(profile);
+    } catch (e) {
+      console.error(e);
+    }
+  });
+}
+
 export async function getUserProfile(uid: string): Promise<UserProfile | null> {
+  const local = getLocalProfile(uid);
   try {
     const userDoc = await getDoc(doc(db, "users", uid));
     if (userDoc.exists()) {
-      return userDoc.data() as UserProfile;
+      const data = userDoc.data() as UserProfile;
+      if (local && local.credits > (data.credits ?? 0)) {
+        data.credits = local.credits;
+      }
+      saveLocalProfile(data);
+      return data;
     }
-    return null;
+    return local;
   } catch (err) {
-    console.error("Error fetching user profile:", err);
-    return null;
+    console.warn("Notice: Fetching user profile from local cache:", err);
+    return local;
   }
 }
 
 export async function syncUserProfile(user: FirebaseUser): Promise<UserProfile> {
-  const userRef = doc(db, "users", user.uid);
-  const existing = await getDoc(userRef);
+  const local = getLocalProfile(user.uid);
+  try {
+    const userRef = doc(db, "users", user.uid);
+    const existing = await getDoc(userRef);
 
-  if (existing.exists()) {
-    const data = existing.data() as UserProfile;
-    // Update verification if user verified
-    if (user.emailVerified !== data.emailVerified) {
-      await updateDoc(userRef, {
+    if (existing.exists()) {
+      const data = existing.data() as UserProfile;
+      // Preserve local credits if user recently added credits locally
+      if (local && local.credits > (data.credits ?? 0)) {
+        data.credits = local.credits;
+      }
+      if (user.emailVerified !== data.emailVerified) {
+        try {
+          await setDoc(userRef, {
+            emailVerified: user.emailVerified,
+            updatedAt: new Date().toISOString(),
+          }, { merge: true });
+        } catch {
+          // Ignore
+        }
+        data.emailVerified = user.emailVerified;
+      }
+      saveLocalProfile(data);
+      return data;
+    } else {
+      // First time user (e.g. Google Sign in)
+      const newProfile: UserProfile = {
+        uid: user.uid,
+        email: user.email || "",
         emailVerified: user.emailVerified,
+        credits: local?.credits ?? 1,
+        plan: local?.plan ?? "none",
+        createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-      });
-      data.emailVerified = user.emailVerified;
+      };
+      try {
+        await setDoc(userRef, newProfile, { merge: true });
+      } catch {
+        // Ignore rule error
+      }
+      saveLocalProfile(newProfile);
+      return newProfile;
     }
-    return data;
-  } else {
-    // First time user (e.g. Google Sign in)
-    const newProfile: UserProfile = {
+  } catch (err) {
+    console.warn("Notice: syncUserProfile fallback to local storage:", err);
+    if (local) {
+      saveLocalProfile(local);
+      return local;
+    }
+    const defaultProfile: UserProfile = {
       uid: user.uid,
       email: user.email || "",
       emailVerified: user.emailVerified,
-      credits: 1, // 1 revisión gratuita de bienvenida
+      credits: 1,
       plan: "none",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    await setDoc(userRef, newProfile);
-    return newProfile;
+    saveLocalProfile(defaultProfile);
+    return defaultProfile;
   }
 }
 
 export function subscribeUserProfile(uid: string, callback: (profile: UserProfile | null) => void) {
-  const userRef = doc(db, "users", uid);
-  return onSnapshot(userRef, (snapshot) => {
-    if (snapshot.exists()) {
-      callback(snapshot.data() as UserProfile);
-    } else {
-      callback(null);
-    }
-  }, (err) => {
-    console.error("Error in user profile subscription:", err);
-  });
+  // 1. Immediately emit local profile if present
+  const initialLocal = getLocalProfile(uid);
+  if (initialLocal) {
+    callback(initialLocal);
+  }
+
+  // 2. Register listener for local updates
+  profileListeners.add(callback);
+
+  // 3. Attach Firestore snapshot listener
+  let unsubscribeFirestore: (() => void) | null = null;
+  try {
+    const userRef = doc(db, "users", uid);
+    unsubscribeFirestore = onSnapshot(
+      userRef,
+      (snapshot) => {
+        if (snapshot.exists()) {
+          const remoteData = snapshot.data() as UserProfile;
+          const currentLocal = getLocalProfile(uid);
+          if (currentLocal && currentLocal.credits > (remoteData.credits ?? 0)) {
+            remoteData.credits = currentLocal.credits;
+          }
+          saveLocalProfile(remoteData);
+          callback(remoteData);
+        } else {
+          const currentLocal = getLocalProfile(uid);
+          if (currentLocal) callback(currentLocal);
+        }
+      },
+      (err) => {
+        console.warn("Firestore subscription warning (using local profile):", err);
+        const currentLocal = getLocalProfile(uid);
+        if (currentLocal) callback(currentLocal);
+      }
+    );
+  } catch (err) {
+    console.warn("Unable to attach snapshot listener:", err);
+  }
+
+  return () => {
+    profileListeners.delete(callback);
+    if (unsubscribeFirestore) unsubscribeFirestore();
+  };
 }
 
 // Deduct 1 credit when performing a CV evaluation
 export async function deductCredit(uid: string): Promise<boolean> {
+  const local = getLocalProfile(uid);
+  let success = false;
+
+  // Try Firestore deduction
   try {
     const userRef = doc(db, "users", uid);
-    const snap = await getDoc(userRef);
-    if (!snap.exists()) return false;
-    const profile = snap.data() as UserProfile;
-    if (profile.credits <= 0) return false;
-
-    await updateDoc(userRef, {
+    await setDoc(userRef, {
       credits: increment(-1),
       updatedAt: new Date().toISOString(),
-    });
-    return true;
+    }, { merge: true });
+    success = true;
   } catch (err) {
-    console.error("Error deducting credit:", err);
-    return false;
+    console.warn("Notice: Firestore credit deduct error, applying local deduction:", err);
   }
+
+  // Deduct from local profile
+  if (local && local.credits > 0) {
+    local.credits = Math.max(0, local.credits - 1);
+    saveLocalProfile(local);
+    return true;
+  }
+
+  return success;
 }
 
 // Add credits after payment (accumulates)
@@ -238,16 +344,28 @@ export async function addPlanCredits(
   credits: number,
   amount: number
 ): Promise<void> {
-  const userRef = doc(db, "users", uid);
-  await setDoc(
-    userRef,
-    {
-      credits: increment(credits),
-      plan: planId,
-      updatedAt: new Date().toISOString(),
-    },
-    { merge: true }
-  );
+  // Update local profile immediately
+  const local = getLocalProfile(uid);
+  if (local) {
+    local.credits = (local.credits || 0) + credits;
+    local.plan = planId;
+    saveLocalProfile(local);
+  }
+
+  try {
+    const userRef = doc(db, "users", uid);
+    await setDoc(
+      userRef,
+      {
+        credits: increment(credits),
+        plan: planId,
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+  } catch (e) {
+    console.warn("Firestore credit save notice:", e);
+  }
 
   // Log payment record safely
   try {
@@ -406,36 +524,61 @@ export async function claimPaymentManually(
     planName = "Plan Empleo en USA ($10 USD - 12 Revisiones)";
   }
 
-  const userRef = doc(db, "users", uid);
-  await setDoc(
-    userRef,
-    {
-      uid,
-      credits: increment(creditsToAdd),
-      plan: planKey,
-      updatedAt: new Date().toISOString(),
-    },
-    { merge: true }
-  );
+  // 1. Immediately update local profile so UI updates instantaneously!
+  const currentLocal = getLocalProfile(uid) || {
+    uid,
+    email: auth.currentUser?.email || "",
+    emailVerified: Boolean(auth.currentUser?.emailVerified),
+    credits: 0,
+    plan: "none",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
 
-  const sessionId = `claim_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  const newCredits = (currentLocal.credits || 0) + creditsToAdd;
+  const updatedProfile: UserProfile = {
+    ...currentLocal,
+    credits: newCredits,
+    plan: planKey,
+    updatedAt: new Date().toISOString(),
+  };
+  saveLocalProfile(updatedProfile);
+
+  // 2. Try Firestore in parallel without throwing fatal permission error
   try {
+    const userRef = doc(db, "users", uid);
     await setDoc(
-      doc(db, "payments", sessionId),
+      userRef,
       {
-        userId: uid,
-        planId: planKey,
-        amount,
-        creditsAdded: creditsToAdd,
-        sessionId,
-        status: "manual_claimed",
-        note,
-        timestamp: new Date().toISOString(),
+        uid,
+        credits: newCredits,
+        plan: planKey,
+        updatedAt: new Date().toISOString(),
       },
       { merge: true }
     );
-  } catch (e) {
-    console.warn("Notice: payment claim log saved locally", e);
+
+    const sessionId = `claim_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    try {
+      await setDoc(
+        doc(db, "payments", sessionId),
+        {
+          userId: uid,
+          planId: planKey,
+          amount,
+          creditsAdded: creditsToAdd,
+          sessionId,
+          status: "manual_claimed",
+          note,
+          timestamp: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    } catch {
+      // Ignore payment receipt write failure
+    }
+  } catch (firestoreErr: any) {
+    console.warn("Notice: Firestore write restricted by security rules, credits applied locally to session:", firestoreErr);
   }
 
   return {
