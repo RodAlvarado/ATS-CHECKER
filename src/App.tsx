@@ -896,16 +896,6 @@ export default function App() {
                   <span>+ Planes</span>
                 </button>
 
-                {/* Sincronizar Pago button */}
-                <button
-                  onClick={() => setSyncPaymentModalOpen(true)}
-                  className="flex items-center space-x-1 px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-lg font-bold text-xs shadow-xs transition-colors cursor-pointer"
-                  title="¿Realizaste un pago en Stripe? Sincroniza y recarga tus revisiones de inmediato"
-                >
-                  <RefreshCw className="w-3 h-3 text-emerald-600" />
-                  <span className="hidden sm:inline">Sincronizar Pago</span>
-                </button>
-
                 {/* User email & logout */}
                 <span className="text-slate-600 max-w-[120px] sm:max-w-[160px] truncate font-medium text-xs">
                   {currentUser.email}
@@ -1119,16 +1109,6 @@ export default function App() {
                 >
                   Ver Planes →
                 </button>
-                {currentUser && (
-                  <button
-                    onClick={() => setSyncPaymentModalOpen(true)}
-                    className="px-3 py-1.5 bg-blue-500/20 hover:bg-blue-500/30 text-blue-200 hover:text-white border border-blue-400/40 font-bold rounded-lg text-xs transition-colors cursor-pointer flex items-center space-x-1"
-                    title="¿Pagaste en Stripe y no se cargó? Haz clic aquí"
-                  >
-                    <RefreshCw className="w-3 h-3 text-blue-300" />
-                    <span>Sincronizar Pago</span>
-                  </button>
-                )}
               </div>
             </div>
 

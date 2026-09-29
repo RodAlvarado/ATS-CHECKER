@@ -201,17 +201,12 @@ export async function getUserProfile(uid: string): Promise<UserProfile | null> {
 }
 
 export async function syncUserProfile(user: FirebaseUser): Promise<UserProfile> {
-  const local = getLocalProfile(user.uid);
   try {
     const userRef = doc(db, "users", user.uid);
     const existing = await getDoc(userRef);
 
     if (existing.exists()) {
       const data = existing.data() as UserProfile;
-      // Preserve local credits if user recently added credits locally
-      if (local && local.credits > (data.credits ?? 0)) {
-        data.credits = local.credits;
-      }
       if (user.emailVerified !== data.emailVerified) {
         try {
           await setDoc(userRef, {
@@ -231,23 +226,19 @@ export async function syncUserProfile(user: FirebaseUser): Promise<UserProfile> 
         uid: user.uid,
         email: user.email || "",
         emailVerified: user.emailVerified,
-        credits: local?.credits ?? 1,
-        plan: local?.plan ?? "none",
+        credits: 1, // 1 crédito de bienvenida
+        plan: "none",
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
-      try {
-        await setDoc(userRef, newProfile, { merge: true });
-      } catch {
-        // Ignore rule error
-      }
+      await setDoc(userRef, newProfile, { merge: true });
       saveLocalProfile(newProfile);
       return newProfile;
     }
   } catch (err) {
     console.warn("Notice: syncUserProfile fallback to local storage:", err);
+    const local = getLocalProfile(user.uid);
     if (local) {
-      saveLocalProfile(local);
       return local;
     }
     const defaultProfile: UserProfile = {
@@ -265,7 +256,7 @@ export async function syncUserProfile(user: FirebaseUser): Promise<UserProfile> 
 }
 
 export function subscribeUserProfile(uid: string, callback: (profile: UserProfile | null) => void) {
-  // 1. Immediately emit local profile if present
+  // 1. Immediately emit local profile if present for instantaneous render
   const initialLocal = getLocalProfile(uid);
   if (initialLocal) {
     callback(initialLocal);
@@ -274,7 +265,7 @@ export function subscribeUserProfile(uid: string, callback: (profile: UserProfil
   // 2. Register listener for local updates
   profileListeners.add(callback);
 
-  // 3. Attach Firestore snapshot listener
+  // 3. Attach Firestore snapshot listener for real-time multi-device synchronization
   let unsubscribeFirestore: (() => void) | null = null;
   try {
     const userRef = doc(db, "users", uid);
@@ -283,10 +274,6 @@ export function subscribeUserProfile(uid: string, callback: (profile: UserProfil
       (snapshot) => {
         if (snapshot.exists()) {
           const remoteData = snapshot.data() as UserProfile;
-          const currentLocal = getLocalProfile(uid);
-          if (currentLocal && currentLocal.credits > (remoteData.credits ?? 0)) {
-            remoteData.credits = currentLocal.credits;
-          }
           saveLocalProfile(remoteData);
           callback(remoteData);
         } else {

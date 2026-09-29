@@ -78,7 +78,7 @@ async function generateContentWithRetry(params: {
   model?: string;
 }): Promise<any> {
   const modelsToTry = [
-    params.model || "gemini-3.5-flash",
+    params.model || "gemini-3.8-flash",
     "gemini-flash-latest",
     "gemini-3.1-flash-lite",
   ];
@@ -265,7 +265,7 @@ Divide tus recomendaciones en viñetas simples y accionables bajo estos tres pil
     });
 
     const response = await generateContentWithRetry({
-      model: "gemini-3.5-flash",
+      model: "gemini-3.8-flash",
       contents: contents,
       config: {
         systemInstruction: systemInstruction,
@@ -348,9 +348,16 @@ Divide tus recomendaciones en viñetas simples y accionables bajo estos tres pil
     res.json(parsedResult);
   } catch (error: any) {
     console.error("Error evaluating CV:", error);
+    const msg = error?.message || String(error);
+    let friendlyMessage = "Error interno al procesar la evaluación.";
+    if (msg.includes("API key not valid") || msg.includes("API_KEY_INVALID")) {
+      friendlyMessage = "La clave GEMINI_API_KEY en tu servidor de Render no es válida o está inactiva en Google Cloud. Por favor genera una API Key gratuita en aistudio.google.com/app/apikey y configúrala en Render (Environment Variables).";
+    } else if (msg.includes("quota") || msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED")) {
+      friendlyMessage = "Límite de cuota temporal en la API de Gemini. Por favor espera 30 segundos e intenta nuevamente.";
+    }
     res.status(500).json({
-      error: "Error interno al procesar la evaluación.",
-      details: error?.message || String(error),
+      error: friendlyMessage,
+      details: msg,
     });
   }
 });
@@ -392,7 +399,7 @@ Contexto de la descripción del trabajo (opcional): "${jobDescription || 'No pro
 `;
 
     const response = await generateContentWithRetry({
-      model: "gemini-3.5-flash",
+      model: "gemini-3.8-flash",
       contents: userPrompt,
       config: {
         systemInstruction: systemInstruction,
@@ -509,7 +516,7 @@ ${cvText}
 `;
 
     const response = await generateContentWithRetry({
-      model: "gemini-3.5-flash",
+      model: "gemini-3.8-flash",
       contents: userPrompt,
       config: {
         systemInstruction: systemInstruction,
@@ -534,9 +541,14 @@ ${cvText}
     res.json(parsedResult);
   } catch (error: any) {
     console.error("Error generating optimized CV:", error);
+    const msg = error?.message || String(error);
+    let friendlyMessage = "Error interno al optimizar el CV completo.";
+    if (msg.includes("API key not valid") || msg.includes("API_KEY_INVALID")) {
+      friendlyMessage = "La clave GEMINI_API_KEY no es válida o está deshabilitada en Google Cloud. Configura una API key válida de Google AI Studio (aistudio.google.com/app/apikey) en Render.";
+    }
     res.status(500).json({
-      error: "Error interno al optimizar el CV completo.",
-      details: error?.message || String(error),
+      error: friendlyMessage,
+      details: msg,
     });
   }
 });
