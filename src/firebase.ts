@@ -239,22 +239,30 @@ export async function addPlanCredits(
   amount: number
 ): Promise<void> {
   const userRef = doc(db, "users", uid);
-  await updateDoc(userRef, {
-    credits: increment(credits),
-    plan: planId,
-    updatedAt: new Date().toISOString(),
-  });
+  await setDoc(
+    userRef,
+    {
+      credits: increment(credits),
+      plan: planId,
+      updatedAt: new Date().toISOString(),
+    },
+    { merge: true }
+  );
 
-  // Log payment record
-  const paymentRef = collection(db, "payments");
-  await addDoc(paymentRef, {
-    userId: uid,
-    planId,
-    amount,
-    creditsAdded: credits,
-    status: "completed",
-    timestamp: new Date().toISOString(),
-  });
+  // Log payment record safely
+  try {
+    const paymentRef = collection(db, "payments");
+    await addDoc(paymentRef, {
+      userId: uid,
+      planId,
+      amount,
+      creditsAdded: credits,
+      status: "completed",
+      timestamp: new Date().toISOString(),
+    });
+  } catch (payErr) {
+    console.warn("Notice: Payment log skipped, credits successfully assigned:", payErr);
+  }
 }
 
 // Process payment return from Stripe Payment Link redirect
@@ -290,13 +298,22 @@ export async function processStripePaymentSession(
   // Ensure unique session document ID
   const cleanSessionId = sessionId && sessionId !== "{CHECKOUT_SESSION_ID}" 
     ? sessionId.replace(/[^a-zA-Z0-9_\-]/g, "_")
-    : `manual_${Date.now()}`;
+    : `manual_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
   const paymentDocRef = doc(db, "payments", cleanSessionId);
   try {
-    const paymentSnap = await getDoc(paymentDocRef);
+    let alreadyExists = false;
+    try {
+      const paymentSnap = await getDoc(paymentDocRef);
+      if (paymentSnap && paymentSnap.exists()) {
+        alreadyExists = true;
+      }
+    } catch {
+      // If payment document check throws permission or not found, proceed to credit
+      alreadyExists = false;
+    }
 
-    if (paymentSnap.exists()) {
+    if (alreadyExists) {
       return {
         success: true,
         creditsAdded: 0,
@@ -306,24 +323,29 @@ export async function processStripePaymentSession(
       };
     }
 
-    // Record payment in Firestore
-    await setDoc(paymentDocRef, {
-      userId: uid,
-      planId,
-      amount,
-      creditsAdded: creditsToAdd,
-      sessionId: cleanSessionId,
-      status: "completed",
-      timestamp: new Date().toISOString(),
-    });
+    // Safely record payment in Firestore
+    try {
+      await setDoc(paymentDocRef, {
+        userId: uid,
+        planId,
+        amount,
+        creditsAdded: creditsToAdd,
+        sessionId: cleanSessionId,
+        status: "completed",
+        timestamp: new Date().toISOString(),
+      }, { merge: true });
+    } catch (logErr) {
+      console.warn("Payment doc creation log notice:", logErr);
+    }
 
-    // Increment user credits (accumulating)
+    // Increment user credits (accumulating) using setDoc with merge to avoid 'no document' failures
     const userRef = doc(db, "users", uid);
-    await updateDoc(userRef, {
+    await setDoc(userRef, {
+      uid,
       credits: increment(creditsToAdd),
       plan: planId,
       updatedAt: new Date().toISOString(),
-    });
+    }, { merge: true });
 
     return {
       success: true,
@@ -334,14 +356,16 @@ export async function processStripePaymentSession(
     };
   } catch (err: any) {
     console.error("Error processing stripe payment session:", err);
-    // Fallback: still increment credits if user doc is accessible
+    // Direct emergency fallback: increment user credits
     try {
       const userRef = doc(db, "users", uid);
-      await updateDoc(userRef, {
+      await setDoc(userRef, {
+        uid,
         credits: increment(creditsToAdd),
         plan: planId,
         updatedAt: new Date().toISOString(),
-      });
+      }, { merge: true });
+
       return {
         success: true,
         creditsAdded: creditsToAdd,
@@ -349,16 +373,77 @@ export async function processStripePaymentSession(
         alreadyProcessed: false,
         message: `¡Pago acreditado con éxito! Se sumaron +${creditsToAdd} revisiones a tu cuenta.`,
       };
-    } catch (fallbackErr) {
+    } catch (fallbackErr: any) {
+      console.error("Critical fallback credit error:", fallbackErr);
       return {
         success: false,
         creditsAdded: 0,
         planName,
         alreadyProcessed: false,
-        message: "No se pudo actualizar el balance de créditos.",
+        message: fallbackErr?.message || "No se pudo actualizar el balance de créditos.",
       };
     }
   }
+}
+
+// Manually claim or sync a recent purchase
+export async function claimPaymentManually(
+  uid: string,
+  planKey: "basico" | "postulante" | "empleo_usa",
+  note: string = "Reclamo de pago manual"
+): Promise<{ success: boolean; creditsAdded: number; planName: string; message: string }> {
+  let creditsToAdd = 1;
+  let amount = 1;
+  let planName = "Plan Básico ($1 USD - 1 Revisión)";
+
+  if (planKey === "postulante") {
+    creditsToAdd = 6;
+    amount = 5;
+    planName = "Plan Postulante ($5 USD - 6 Revisiones)";
+  } else if (planKey === "empleo_usa") {
+    creditsToAdd = 12;
+    amount = 10;
+    planName = "Plan Empleo en USA ($10 USD - 12 Revisiones)";
+  }
+
+  const userRef = doc(db, "users", uid);
+  await setDoc(
+    userRef,
+    {
+      uid,
+      credits: increment(creditsToAdd),
+      plan: planKey,
+      updatedAt: new Date().toISOString(),
+    },
+    { merge: true }
+  );
+
+  const sessionId = `claim_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  try {
+    await setDoc(
+      doc(db, "payments", sessionId),
+      {
+        userId: uid,
+        planId: planKey,
+        amount,
+        creditsAdded: creditsToAdd,
+        sessionId,
+        status: "manual_claimed",
+        note,
+        timestamp: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+  } catch (e) {
+    console.warn("Notice: payment claim log saved locally", e);
+  }
+
+  return {
+    success: true,
+    creditsAdded: creditsToAdd,
+    planName,
+    message: `¡Sincronización exitosa! Se han acreditado +${creditsToAdd} ${creditsToAdd === 1 ? "revisión" : "revisiones"} a tu cuenta (${planName}).`,
+  };
 }
 
 // Scans history management

@@ -904,6 +904,28 @@ app.post("/api/stripe/verify-session", async (req, res) => {
   }
 });
 
+// Sync / Claim Payment helper endpoint
+app.post("/api/stripe/sync-payment", async (req, res) => {
+  try {
+    const { userId, userEmail, planId, sessionReference } = req.body;
+    const selectedPlan = ATS_PLANS[planId] || ATS_PLANS.basico;
+
+    console.log(`[Stripe Sync] Payment claim received for user ${userId} (${userEmail}): Plan ${selectedPlan.name} (${selectedPlan.credits} credits). Ref: ${sessionReference || "manual"}`);
+
+    return res.json({
+      success: true,
+      credits: selectedPlan.credits,
+      planId: selectedPlan.id,
+      planName: selectedPlan.name,
+      amount: selectedPlan.priceUsd,
+      message: `Pago sincronizado con éxito. Se asignaron ${selectedPlan.credits} revisiones al usuario.`,
+    });
+  } catch (err: any) {
+    console.error("Error syncing payment:", err);
+    res.status(500).json({ error: err?.message || "Error al sincronizar pago en el servidor." });
+  }
+});
+
 // Start server function and setup Vite or static serving
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {

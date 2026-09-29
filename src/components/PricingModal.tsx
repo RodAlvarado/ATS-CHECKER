@@ -10,6 +10,7 @@ interface PricingModalProps {
   userProfile: UserProfile | null;
   onPlanPurchased: (creditsAdded: number, planName: string) => void;
   onRequireAuth: () => void;
+  onOpenSyncPayment?: () => void;
 }
 
 export const PricingModal: React.FC<PricingModalProps> = ({
@@ -19,6 +20,7 @@ export const PricingModal: React.FC<PricingModalProps> = ({
   userProfile,
   onPlanPurchased,
   onRequireAuth,
+  onOpenSyncPayment,
 }) => {
   const [loadingPlan, setLoadingPlan] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -277,6 +279,26 @@ export const PricingModal: React.FC<PricingModalProps> = ({
               </div>
             ))}
           </div>
+
+          {/* Sync Payment Helper if user paid and balance hasn't refreshed */}
+          {user && onOpenSyncPayment && (
+            <div className="p-3 bg-blue-50/80 border border-blue-200 rounded-xl flex items-center justify-between text-xs text-blue-900">
+              <div className="flex items-center space-x-2">
+                <Zap className="w-4 h-4 text-blue-600 shrink-0" />
+                <span>¿Completaste tu pago en Stripe y aún no ves tus revisiones?</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  onOpenSyncPayment();
+                }}
+                className="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg transition-colors cursor-pointer text-[11px] shrink-0 ml-2"
+              >
+                Sincronizar mi pago ahora
+              </button>
+            </div>
+          )}
 
           {/* Guarantee / Trust footer */}
           <div className="p-4 bg-slate-50 border border-slate-200 rounded-2xl flex flex-col sm:flex-row items-center justify-between gap-4 text-slate-600 text-xs">

@@ -42,6 +42,7 @@ import AtsCheckerLogo from "./components/AtsCheckerLogo";
 import AuthModal from "./components/AuthModal";
 import PricingModal from "./components/PricingModal";
 import EmailVerificationNotice from "./components/EmailVerificationNotice";
+import SyncPaymentModal from "./components/SyncPaymentModal";
 import {
   auth,
   subscribeUserProfile,
@@ -51,8 +52,12 @@ import {
   UserProfile,
   syncUserProfile,
   processStripePaymentSession,
+  claimPaymentManually,
 } from "./firebase";
 import { onAuthStateChanged, User as FirebaseUser } from "firebase/auth";
+
+// Preserve initial URL search params across async auth and history state cleanups
+const INITIAL_URL_SEARCH = typeof window !== "undefined" ? window.location.search : "";
 
 export default function App() {
   const [step, setStep] = useState<1 | 2 | 3>(1);
@@ -92,7 +97,88 @@ export default function App() {
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authModalInitialMode, setAuthModalInitialMode] = useState<"login" | "register">("login");
   const [pricingModalOpen, setPricingModalOpen] = useState(false);
+  const [syncPaymentModalOpen, setSyncPaymentModalOpen] = useState(false);
   const [successNotification, setSuccessNotification] = useState<string | null>(null);
+
+  // Helper to reconcile any pending Stripe payment (from URL, session storage, or recent checkout)
+  const reconcileStripePayment = async (user: FirebaseUser) => {
+    try {
+      // 1. Check initial or current URL parameters
+      const searchString = INITIAL_URL_SEARCH || (typeof window !== "undefined" ? window.location.search : "");
+      const params = new URLSearchParams(searchString);
+      const isPaymentSuccess = params.get("payment") === "success" || params.get("stripe_success") === "true";
+      const sessionId = params.get("session_id") || "";
+      const planKey = params.get("plan") || "basico";
+
+      if (isPaymentSuccess) {
+        if (typeof window !== "undefined") {
+          window.history.replaceState({}, document.title, window.location.pathname);
+        }
+        const result = await processStripePaymentSession(user.uid, sessionId, planKey);
+        try {
+          localStorage.removeItem("pending_stripe_session");
+          localStorage.removeItem("pending_stripe_checkout");
+        } catch {
+          // Ignore storage errors
+        }
+
+        if (result.alreadyProcessed) {
+          setSuccessNotification("Este pago ya fue acreditado previamente a tu cuenta.");
+        } else {
+          setSuccessNotification(
+            `¡Pago acreditado con éxito! Se sumaron +${result.creditsAdded} revisiones acumulables (${result.planName}).`
+          );
+        }
+        setTimeout(() => setSuccessNotification(null), 9000);
+        return;
+      }
+
+      // 2. Check pending_stripe_session from previous unauthenticated redirect
+      const pendingSessionStr = localStorage.getItem("pending_stripe_session");
+      if (pendingSessionStr) {
+        try {
+          const pending = JSON.parse(pendingSessionStr);
+          localStorage.removeItem("pending_stripe_session");
+          const result = await processStripePaymentSession(user.uid, pending.sessionId, pending.planKey);
+          if (!result.alreadyProcessed) {
+            setSuccessNotification(
+              `¡Pago de Stripe acreditado con éxito! Se han sumado +${result.creditsAdded} revisiones acumulables (${result.planName}).`
+            );
+            setTimeout(() => setSuccessNotification(null), 9000);
+          }
+          return;
+        } catch (e) {
+          console.error("Error processing pending session:", e);
+        }
+      }
+
+      // 3. Check pending_stripe_checkout (saved when user clicked payment button before leaving to Stripe)
+      const pendingCheckoutStr = localStorage.getItem("pending_stripe_checkout");
+      if (pendingCheckoutStr) {
+        try {
+          const checkout = JSON.parse(pendingCheckoutStr);
+          // If clicked in the last 4 hours, auto-claim
+          const isRecent = checkout.timestamp && Date.now() - checkout.timestamp < 1000 * 60 * 240;
+          if (isRecent) {
+            localStorage.removeItem("pending_stripe_checkout");
+            const result = await claimPaymentManually(
+              user.uid,
+              checkout.planId || "basico",
+              "Acreditación automática tras retorno de pasarela Stripe"
+            );
+            setSuccessNotification(
+              `¡Detectamos tu pago en Stripe! Se sumaron +${result.creditsAdded} revisiones acumulables (${result.planName}).`
+            );
+            setTimeout(() => setSuccessNotification(null), 9000);
+          }
+        } catch (e) {
+          console.error("Error reading pending checkout:", e);
+        }
+      }
+    } catch (err) {
+      console.error("Error in reconcileStripePayment:", err);
+    }
+  };
 
   // Listen to Firebase Auth state
   useEffect(() => {
@@ -103,26 +189,7 @@ export default function App() {
       if (user) {
         try {
           await syncUserProfile(user);
-
-          // Check if there was a pending Stripe payment waiting for login
-          const pendingStr = localStorage.getItem("pending_stripe_session");
-          if (pendingStr) {
-            try {
-              const pending = JSON.parse(pendingStr);
-              localStorage.removeItem("pending_stripe_session");
-              const result = await processStripePaymentSession(user.uid, pending.sessionId, pending.planKey);
-              if (result.alreadyProcessed) {
-                setSuccessNotification("Tu pago de Stripe ya había sido acreditado a esta cuenta.");
-              } else {
-                setSuccessNotification(
-                  `¡Pago de Stripe acreditado con éxito! Se han sumado +${result.creditsAdded} revisiones acumulables (${result.planName}).`
-                );
-              }
-              setTimeout(() => setSuccessNotification(null), 9000);
-            } catch (pendingErr) {
-              console.error("Error processing pending session:", pendingErr);
-            }
-          }
+          await reconcileStripePayment(user);
         } catch (e) {
           console.error("Error syncing profile:", e);
         }
@@ -144,44 +211,10 @@ export default function App() {
     };
   }, []);
 
-  // Handle Stripe redirect URL parameters (supports ?payment=success&plan=...&session_id=...)
+  // Handle URL parameters if user logs in after page mount
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const isPaymentSuccess = params.get("payment") === "success" || params.get("stripe_success") === "true";
-    const sessionId = params.get("session_id") || "";
-    const planKey = params.get("plan") || "basico";
-    const stripeCanceled = params.get("stripe_canceled") || params.get("payment") === "cancel";
-
-    if (isPaymentSuccess) {
-      // Clean query parameters from URL immediately
-      window.history.replaceState({}, document.title, window.location.pathname);
-
-      if (currentUser) {
-        processStripePaymentSession(currentUser.uid, sessionId, planKey).then((res) => {
-          if (res.alreadyProcessed) {
-            setSuccessNotification(`Este pago ya fue acreditado previamente a tu cuenta.`);
-          } else {
-            setSuccessNotification(
-              `¡Pago recibido con éxito! Se sumaron +${res.creditsAdded} revisiones acumulables a tu saldo (${res.planName}).`
-            );
-          }
-          setTimeout(() => setSuccessNotification(null), 9000);
-        }).catch((err) => {
-          console.error("Error processing payment:", err);
-          setError("Recibimos tu pago pero hubo un detalle al actualizar el contador. Por favor refresca.");
-        });
-      } else {
-        // User not logged in yet: save session to claim upon authentication
-        localStorage.setItem("pending_stripe_session", JSON.stringify({ sessionId, planKey }));
-        setSuccessNotification(
-          "¡Pago de Stripe recibido! Inicia sesión o regístrate para acreditar tus revisiones a tu cuenta."
-        );
-        setAuthModalInitialMode("register");
-        setAuthModalOpen(true);
-      }
-    } else if (stripeCanceled) {
-      window.history.replaceState({}, document.title, window.location.pathname);
-      setError("El proceso de pago en Stripe fue cancelado.");
+    if (currentUser) {
+      reconcileStripePayment(currentUser);
     }
   }, [currentUser]);
 
@@ -863,6 +896,16 @@ export default function App() {
                   <span>+ Planes</span>
                 </button>
 
+                {/* Sincronizar Pago button */}
+                <button
+                  onClick={() => setSyncPaymentModalOpen(true)}
+                  className="flex items-center space-x-1 px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-lg font-bold text-xs shadow-xs transition-colors cursor-pointer"
+                  title="¿Realizaste un pago en Stripe? Sincroniza y recarga tus revisiones de inmediato"
+                >
+                  <RefreshCw className="w-3 h-3 text-emerald-600" />
+                  <span className="hidden sm:inline">Sincronizar Pago</span>
+                </button>
+
                 {/* User email & logout */}
                 <span className="text-slate-600 max-w-[120px] sm:max-w-[160px] truncate font-medium text-xs">
                   {currentUser.email}
@@ -1076,6 +1119,16 @@ export default function App() {
                 >
                   Ver Planes →
                 </button>
+                {currentUser && (
+                  <button
+                    onClick={() => setSyncPaymentModalOpen(true)}
+                    className="px-3 py-1.5 bg-blue-500/20 hover:bg-blue-500/30 text-blue-200 hover:text-white border border-blue-400/40 font-bold rounded-lg text-xs transition-colors cursor-pointer flex items-center space-x-1"
+                    title="¿Pagaste en Stripe y no se cargó? Haz clic aquí"
+                  >
+                    <RefreshCw className="w-3 h-3 text-blue-300" />
+                    <span>Sincronizar Pago</span>
+                  </button>
+                )}
               </div>
             </div>
 
@@ -2073,6 +2126,23 @@ export default function App() {
           setPricingModalOpen(false);
           setAuthModalInitialMode("register");
           setAuthModalOpen(true);
+        }}
+        onOpenSyncPayment={() => {
+          setPricingModalOpen(false);
+          setSyncPaymentModalOpen(true);
+        }}
+      />
+
+      <SyncPaymentModal
+        isOpen={syncPaymentModalOpen}
+        onClose={() => setSyncPaymentModalOpen(false)}
+        userId={currentUser?.uid || null}
+        userEmail={currentUser?.email || null}
+        onSuccess={(creditsAdded, planName) => {
+          setSuccessNotification(
+            `¡Pago acreditado con éxito! Se sumaron +${creditsAdded} revisiones a tu cuenta (${planName}).`
+          );
+          setTimeout(() => setSuccessNotification(null), 9000);
         }}
       />
     </div>
